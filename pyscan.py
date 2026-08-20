@@ -87,26 +87,53 @@ def load_signatures(refresh=False):
         raise RuntimeError(f"Unable to download signatures: {e}")
 
     signatures = []
-    for line in pattern_data.splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
+    malformed = 0
+
+    for raw_line in pattern_data.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
+
+        if "|" not in line or "_-" not in line or "-_" not in line:
+            continue
+
         try:
             left, regex = line.split("|", 1)
-            score_part = left.split("-_")[1].split(":")[1]
-            score = int(score_part)
-            tag = left.split("_-")[0]
-            name = left.split("_-")[1].split("-_")[0]
+            parts = left.split("-_")
+            if len(parts) < 2 or ":" not in parts[-1]:
+                malformed += 1
+                continue
+
+            score = int(parts[-1].split(":", 1)[1])
+            tag = left.split("_-", 1)[0]
+            name_part = left.split("_-", 1)[1]
+            name = name_part.split("-_", 1)[0]
+
+            if not regex.strip():
+                malformed += 1
+                continue
+
             signatures.append((tag, name, score, regex))
-        except Exception:
-            log(f"Skipping malformed signature line: {line[:120]}", logging.WARNING)
+        except (ValueError, IndexError):
+            malformed += 1
 
     compiled = []
     for tag, name, score, regex in signatures:
         try:
-            compiled.append((tag, name, score, re.compile(regex, re.MULTILINE | re.UNICODE)))
+            compiled.append(
+                (tag, name, score, re.compile(regex, re.MULTILINE | re.UNICODE))
+            )
         except re.error as e:
-            raise RuntimeError(f"Invalid signature {name}: {e}")
+            log(f"Skipping invalid regex signature {name}: {e}", logging.WARNING)
+
+    if malformed:
+        log(f"Ignored {malformed} non-signature/malformed pattern lines", logging.WARNING)
+
+    if not compiled:
+        raise RuntimeError(
+            "No valid regex malware signatures were loaded. "
+            "Refusing to run a hash-only scan."
+        )
 
     md5_blacklist = {x.split()[0].lower() for x in md5_data.splitlines() if x.strip()}
     sha1_whitelist = {x.split()[0].lower() for x in sha1_wl_data.splitlines() if x.strip()}
@@ -243,8 +270,9 @@ def main():
     if os.geteuid() != 0:
         parser.error("Run as root.")
 
-    if not args.path and not args.user:
-        args.path = ["/home"]
+    using_current_directory = not args.path and not args.user
+    if using_current_directory:
+        args.path = [os.getcwd()]
 
     paths = list(args.path)
     for user in args.user:
@@ -262,6 +290,8 @@ def main():
 
     log(f"Pyscan Safe {VERSION} starting")
     log(f"Paths: {', '.join(paths)}")
+    if using_current_directory:
+        log("No path/user supplied; scanning current working directory.")
     log(f"Max file size: {args.max_size_mb} MB; workers: {threads}")
 
     compiled, md5_bl, sha1_wl, sha1_bl = load_signatures(args.refresh_signatures)
