@@ -77,14 +77,50 @@ def cached_download(url, name, refresh=False):
             os.unlink(tmp)
     return data
 
-def load_signatures(refresh=False):
+def load_signatures(refresh=False, patterns_file=None, patterns_url=None):
+    """Load remote/local ShellScannerPatterns plus conservative built-in signatures."""
+    builtin = [
+        ("Builtin", "PHP_EVAL_BASE64", 3,
+         re.compile(r"(?i)\b(?:eval|assert)\s*\(\s*(?:base64_decode|gzinflate|gzuncompress|str_rot13)\s*\(",
+                    re.MULTILINE)),
+        ("Builtin", "PHP_PREG_REPLACE_E", 3,
+         re.compile(r"(?i)\bpreg_replace\s*\(\s*['\"][^'\"]*/e[^'\"]*['\"]",
+                    re.MULTILINE)),
+        ("Builtin", "PHP_SYSTEM_EXEC", 2,
+         re.compile(r"(?i)\b(?:shell_exec|passthru|proc_open|popen)\s*\(",
+                    re.MULTILINE)),
+        ("Builtin", "PHP_DYNAMIC_INCLUDE", 2,
+         re.compile(r"(?i)\b(?:include|require)(?:_once)?\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE|SERVER)\b",
+                    re.MULTILINE)),
+        ("Builtin", "PHP_CREATE_FUNCTION", 2,
+         re.compile(r"(?i)\bcreate_function\s*\(",
+                    re.MULTILINE)),
+    ]
+
+    if patterns_file:
+        pattern_data = Path(patterns_file).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    else:
+        url = patterns_url or PATTERN_URL
+        try:
+            pattern_data = cached_download(
+                url, "ShellScannerPatterns", refresh
+            ).decode("utf-8", "replace")
+        except Exception as e:
+            log(f"Remote regex signatures unavailable: {e}", logging.WARNING)
+            pattern_data = ""
+
     try:
-        pattern_data = cached_download(PATTERN_URL, "ShellScannerPatterns", refresh).decode("utf-8", "replace")
         md5_data = cached_download(MD5_URL, "md5_blacklist", refresh).decode("utf-8", "replace")
         sha1_wl_data = cached_download(SHA1_WL_URL, "pyscan-sha1.whitelist", refresh).decode("utf-8", "replace")
         sha1_bl_data = cached_download(SHA1_BL_URL, "pyscan-sha1.blacklist", refresh).decode("utf-8", "replace")
     except Exception as e:
-        raise RuntimeError(f"Unable to download signatures: {e}")
+        raise RuntimeError(f"Unable to download hash signatures: {e}")
+
+    md5_blacklist = {x.split()[0].lower() for x in md5_data.splitlines() if x.strip()}
+    sha1_whitelist = {x.split()[0].lower() for x in sha1_wl_data.splitlines() if x.strip()}
+    sha1_blacklist = {x.split()[0].lower() for x in sha1_bl_data.splitlines() if x.strip()}
 
     signatures = []
     malformed = 0
@@ -94,52 +130,64 @@ def load_signatures(refresh=False):
         if not line or line.startswith("#"):
             continue
 
-        if "|" not in line or "_-" not in line or "-_" not in line:
+        # Ignore obvious HTML/JavaScript content returned by a bad endpoint.
+        if line.startswith("<") or line.startswith("{") or line.endswith("};"):
+            continue
+
+        if "|" not in line:
             continue
 
         try:
             left, regex = line.split("|", 1)
-            parts = left.split("-_")
-            if len(parts) < 2 or ":" not in parts[-1]:
-                malformed += 1
-                continue
 
-            score = int(parts[-1].split(":", 1)[1])
-            tag = left.split("_-", 1)[0]
-            name_part = left.split("_-", 1)[1]
-            name = name_part.split("-_", 1)[0]
+            # Legacy format used by the original Pyscan:
+            # TAG_-NAME-_SCORE:<number>|REGEX
+            if "_-" in left and "-_" in left:
+                tag, remainder = left.split("_-", 1)
+                name, score_part = remainder.rsplit("-_", 1)
 
-            if not regex.strip():
-                malformed += 1
-                continue
+                if ":" not in score_part:
+                    malformed += 1
+                    continue
 
-            signatures.append((tag, name, score, regex))
+                score = int(score_part.split(":", 1)[1])
+
+                if not tag or not name or not regex.strip():
+                    malformed += 1
+                    continue
+
+                signatures.append((tag, name, score, regex))
+
         except (ValueError, IndexError):
             malformed += 1
 
-    compiled = []
+    compiled = list(builtin)
+
     for tag, name, score, regex in signatures:
         try:
             compiled.append(
-                (tag, name, score, re.compile(regex, re.MULTILINE | re.UNICODE))
+                (tag, name, score,
+                 re.compile(regex, re.MULTILINE | re.UNICODE))
             )
         except re.error as e:
-            log(f"Skipping invalid regex signature {name}: {e}", logging.WARNING)
+            log(
+                f"Skipping invalid remote regex signature {name}: {e}",
+                logging.WARNING
+            )
 
     if malformed:
-        log(f"Ignored {malformed} non-signature/malformed pattern lines", logging.WARNING)
-
-    if not compiled:
-        raise RuntimeError(
-            "No valid regex malware signatures were loaded. "
-            "Refusing to run a hash-only scan."
+        log(
+            f"Ignored {malformed} malformed/non-signature pattern lines",
+            logging.WARNING
         )
 
-    md5_blacklist = {x.split()[0].lower() for x in md5_data.splitlines() if x.strip()}
-    sha1_whitelist = {x.split()[0].lower() for x in sha1_wl_data.splitlines() if x.strip()}
-    sha1_blacklist = {x.split()[0].lower() for x in sha1_bl_data.splitlines() if x.strip()}
+    log(
+        f"Loaded {len(compiled)} regex signatures "
+        f"({len(signatures)} remote + {len(builtin)} built-in)"
+    )
 
     return compiled, md5_blacklist, sha1_whitelist, sha1_blacklist
+
 
 def iter_files(paths, excludes, max_size, exclude_root_owner):
     excludes = [os.path.realpath(x) for x in excludes]
@@ -262,6 +310,8 @@ def main():
     parser.add_argument("-t", "--threads", type=int, default=DEFAULT_WORKERS, help="Worker threads (default: %(default)s)")
     parser.add_argument("--max-size-mb", type=int, default=20, help="Maximum file size in MB (default: 20)")
     parser.add_argument("--refresh-signatures", action="store_true", help="Refresh signature cache")
+    parser.add_argument("--patterns-file", help="Use a local ShellScannerPatterns file")
+    parser.add_argument("--patterns-url", help="Override the remote ShellScannerPatterns URL")
     parser.add_argument("--quarantine", metavar="DIR", help="Move detected files to this directory; OFF by default")
     parser.add_argument("--dry-run", action="store_true", help="Report detections without changing files (default behavior)")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -294,7 +344,7 @@ def main():
         log("No path/user supplied; scanning current working directory.")
     log(f"Max file size: {args.max_size_mb} MB; workers: {threads}")
 
-    compiled, md5_bl, sha1_wl, sha1_bl = load_signatures(args.refresh_signatures)
+    compiled, md5_bl, sha1_wl, sha1_bl = load_signatures(args.refresh_signatures, args.patterns_file, args.patterns_url)
     log(f"Loaded {len(compiled)} regex signatures, {len(md5_bl)} MD5 blacklist entries, "
         f"{len(sha1_bl)} SHA1 blacklist entries, {len(sha1_wl)} SHA1 whitelist entries")
 
